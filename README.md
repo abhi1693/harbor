@@ -5,7 +5,8 @@ This repository does not maintain a Harbor source fork. It only contains GitHub 
 - resolves the latest stable upstream `goharbor/harbor` tag, or uses a manually supplied tag;
 - checks out that upstream tag at workflow runtime;
 - checks `ghcr.io/abhi1693` for existing ARM64 images;
-- builds and publishes only when the target ARM64 image tags are missing.
+- compiles the upstream source once, then builds missing component images in parallel GitHub Actions matrix jobs;
+- publishes only the ARM64 image tags that are missing.
 
 The workflow runs on manual dispatch and on the 1st and 15th of each month.
 

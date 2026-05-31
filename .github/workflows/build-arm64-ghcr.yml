@@ -35,17 +35,23 @@ env:
   UPSTREAM_REPO: https://github.com/goharbor/harbor.git
 
 jobs:
-  build-arm64:
-    name: Build ARM64 images
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 360
+  resolve:
+    name: Resolve tag and image plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      harbor_tag: ${{ steps.tag.outputs.harbor_tag }}
+      upstream_sha: ${{ steps.tag.outputs.upstream_sha }}
+      build: ${{ steps.plan.outputs.build }}
+      alias_missing: ${{ steps.plan.outputs.alias_missing }}
+      verify: ${{ steps.plan.outputs.verify }}
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      alias_matrix: ${{ steps.plan.outputs.alias_matrix }}
+      all_images: ${{ steps.plan.outputs.all_images }}
 
     steps:
       - name: Checkout automation
         uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Resolve upstream tag
         id: tag
@@ -68,47 +74,12 @@ jobs:
             exit 1
           fi
 
-          echo "harbor_tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Check out upstream Harbor tag
-        shell: bash
-        run: |
-          set -euo pipefail
           rm -rf /tmp/harbor-src
-          git clone --depth=1 --branch "${{ steps.tag.outputs.harbor_tag }}" "$UPSTREAM_REPO" /tmp/harbor-src
+          git clone --depth=1 --branch "$tag" "$UPSTREAM_REPO" /tmp/harbor-src
+          upstream_sha="$(git -C /tmp/harbor-src rev-parse --short=8 HEAD)"
 
-      - name: Determine image set
-        id: images
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          images=(
-            prepare
-            harbor-log
-            harbor-db
-            harbor-portal
-            harbor-core
-            harbor-jobservice
-            harbor-registryctl
-            nginx-photon
-            registry-photon
-            trivy-adapter-photon
-            harbor-exporter
-          )
-
-          if [ -d /tmp/harbor-src/make/photon/valkey ]; then
-            images+=(valkey-photon)
-          else
-            images+=(redis-photon)
-          fi
-
-          printf '%s\n' "${images[@]}" | sort -u > "$RUNNER_TEMP/harbor-images.txt"
-          {
-            echo "images<<EOF"
-            cat "$RUNNER_TEMP/harbor-images.txt"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "harbor_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -117,116 +88,215 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check registry tags
-        id: registry
+      - name: Determine missing images
+        id: plan
         shell: bash
         run: |
           set -euo pipefail
-
-          has_arm64() {
-            docker manifest inspect -v "$1" 2>/dev/null | jq -e '
-              if type == "array" then
-                any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
-              else
-                .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
-              end
-            ' >/dev/null
-          }
 
           force_rebuild="${{ github.event.inputs.force_rebuild || 'false' }}"
           publish_latest="${{ github.event.inputs.publish_latest || 'true' }}"
           harbor_tag="${{ steps.tag.outputs.harbor_tag }}"
-          build=false
-          alias_missing=false
 
-          if [ "$force_rebuild" = "true" ]; then
-            build=true
-          else
-            while IFS= read -r image; do
-              [ -n "$image" ] || continue
-              exact="${IMAGE_NAMESPACE}/${image}:${harbor_tag}"
-              arch="${IMAGE_NAMESPACE}/${image}:${harbor_tag}-arm64"
-              latest="${IMAGE_NAMESPACE}/${image}:latest-arm64"
+          plan_json="$(scripts/build-ghcr-arm64.sh plan /tmp/harbor-src "$harbor_tag" "$force_rebuild" "$publish_latest")"
+          build="$(jq -r '.build' <<<"$plan_json")"
+          alias_missing="$(jq -r '.alias_missing' <<<"$plan_json")"
 
-              if ! has_arm64 "$exact"; then
-                echo "Missing ARM64 image: $exact"
-                build=true
-                continue
-              fi
-
-              if ! has_arm64 "$arch"; then
-                echo "Missing ARM64 alias: $arch"
-                alias_missing=true
-              fi
-
-              if [ "$publish_latest" = "true" ] && ! has_arm64 "$latest"; then
-                echo "Missing latest alias: $latest"
-                alias_missing=true
-              fi
-            done <<< "${{ steps.images.outputs.images }}"
-          fi
+          build_matrix="$(jq -c 'if (.build_matrix | length) == 0 then [{image: "noop", target: "noop"}] else .build_matrix end' <<<"$plan_json")"
+          alias_matrix="$(jq -c 'if (.alias_images | length) == 0 then [{image: "noop"}] else [.alias_images[] | {image: .}] end' <<<"$plan_json")"
+          all_images="$(jq -c '.all_images' <<<"$plan_json")"
 
           echo "build=${build}" >> "$GITHUB_OUTPUT"
           echo "alias_missing=${alias_missing}" >> "$GITHUB_OUTPUT"
+          if [ "$build" = "true" ] || [ "$alias_missing" = "true" ]; then
+            echo "verify=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "verify=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "build_matrix=${build_matrix}" >> "$GITHUB_OUTPUT"
+          echo "alias_matrix=${alias_matrix}" >> "$GITHUB_OUTPUT"
+          echo "all_images=${all_images}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish missing ARM64 images
-        if: steps.registry.outputs.build == 'true'
+          echo "Build matrix: ${build_matrix}"
+          echo "Alias matrix: ${alias_matrix}"
+
+  prepare-source:
+    name: Compile upstream source
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Check out upstream Harbor tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/harbor-src
+          git clone --depth=1 --branch "${{ needs.resolve.outputs.harbor_tag }}" "$UPSTREAM_REPO" /tmp/harbor-src
+
+      - name: Compile Harbor once
         env:
-          HARBOR_TAG: ${{ steps.tag.outputs.harbor_tag }}
+          GIT_COMMIT: ${{ needs.resolve.outputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-ghcr-arm64.sh prepare-source /tmp/harbor-src "${{ needs.resolve.outputs.harbor_tag }}"
+
+      - name: Package prepared source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C /tmp -czf "$RUNNER_TEMP/harbor-source.tgz" harbor-src
+
+      - name: Upload prepared source
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbor-source-${{ needs.resolve.outputs.harbor_tag }}
+          path: ${{ runner.temp }}/harbor-source.tgz
+          retention-days: 1
+
+  build-component:
+    name: Build ${{ matrix.image }}
+    needs:
+      - resolve
+      - prepare-source
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        include: ${{ fromJson(needs.resolve.outputs.build_matrix) }}
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
+        with:
+          name: harbor-source-${{ needs.resolve.outputs.harbor_tag }}
+          path: ${{ runner.temp }}/harbor-source
+
+      - name: Extract prepared source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xzf "$RUNNER_TEMP/harbor-source/harbor-source.tgz" -C /tmp
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish component
+        env:
+          GIT_COMMIT: ${{ needs.resolve.outputs.upstream_sha }}
+          HARBOR_TAG: ${{ needs.resolve.outputs.harbor_tag }}
           PUBLISH_LATEST: ${{ github.event.inputs.publish_latest || 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          scripts/build-ghcr-arm64.sh /tmp/harbor-src "$HARBOR_TAG"
+          scripts/build-ghcr-arm64.sh build-component \
+            /tmp/harbor-src \
+            "$HARBOR_TAG" \
+            "${{ matrix.image }}" \
+            "${{ matrix.target }}"
 
-      - name: Maintain alias tags without rebuilding
-        if: steps.registry.outputs.build != 'true' && steps.registry.outputs.alias_missing == 'true'
+  maintain-aliases:
+    name: Maintain aliases for ${{ matrix.image }}
+    needs: resolve
+    if: needs.resolve.outputs.alias_missing == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        include: ${{ fromJson(needs.resolve.outputs.alias_matrix) }}
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create missing aliases
+        env:
+          HARBOR_TAG: ${{ needs.resolve.outputs.harbor_tag }}
+          PUBLISH_LATEST: ${{ github.event.inputs.publish_latest || 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-ghcr-arm64.sh maintain-aliases "$HARBOR_TAG" "${{ matrix.image }}"
+
+  verify:
+    name: Verify ARM64 manifests
+    needs:
+      - resolve
+      - prepare-source
+      - build-component
+      - maintain-aliases
+    if: >-
+      always() &&
+      needs.resolve.outputs.verify == 'true' &&
+      needs.prepare-source.result != 'failure' &&
+      needs.prepare-source.result != 'cancelled' &&
+      needs.build-component.result != 'failure' &&
+      needs.build-component.result != 'cancelled' &&
+      needs.maintain-aliases.result != 'failure' &&
+      needs.maintain-aliases.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify every expected image
         shell: bash
         run: |
           set -euo pipefail
 
-          has_arm64() {
-            docker manifest inspect -v "$1" 2>/dev/null | jq -e '
+          harbor_tag="${{ needs.resolve.outputs.harbor_tag }}"
+          images='${{ needs.resolve.outputs.all_images }}'
+
+          jq -r '.[]' <<<"$images" | while read -r image; do
+            ref="${IMAGE_NAMESPACE}/${image}:${harbor_tag}"
+            echo "Verifying ${ref}"
+            docker manifest inspect -v "$ref" | jq -e '
               if type == "array" then
                 any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
               else
                 .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
               end
             ' >/dev/null
-          }
+          done
 
-          publish_latest="${{ github.event.inputs.publish_latest || 'true' }}"
-          harbor_tag="${{ steps.tag.outputs.harbor_tag }}"
-
-          while IFS= read -r image; do
-            [ -n "$image" ] || continue
-            exact="${IMAGE_NAMESPACE}/${image}:${harbor_tag}"
-            arch="${IMAGE_NAMESPACE}/${image}:${harbor_tag}-arm64"
-            latest="${IMAGE_NAMESPACE}/${image}:latest-arm64"
-
-            if ! has_arm64 "$arch"; then
-              docker buildx imagetools create -t "$arch" "$exact"
-            fi
-
-            if [ "$publish_latest" = "true" ] && ! has_arm64 "$latest"; then
-              docker buildx imagetools create -t "$latest" "$exact"
-            fi
-          done <<< "${{ steps.images.outputs.images }}"
-
+  report-skipped:
+    name: Report skipped build
+    needs: resolve
+    if: needs.resolve.outputs.build != 'true' && needs.resolve.outputs.alias_missing != 'true'
+    runs-on: ubuntu-latest
+    steps:
       - name: Report skipped build
-        if: steps.registry.outputs.build != 'true' && steps.registry.outputs.alias_missing != 'true'
-        run: echo "All ARM64 images already exist for ${{ steps.tag.outputs.harbor_tag }}."
-
-      - name: Verify published image platform
-        if: steps.registry.outputs.build == 'true' || steps.registry.outputs.alias_missing == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker manifest inspect -v "${IMAGE_NAMESPACE}/harbor-core:${{ steps.tag.outputs.harbor_tag }}" \
-            | jq -e '
-              if type == "array" then
-                any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
-              else
-                .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
-              end
-            '
+        run: echo "All ARM64 images and aliases already exist for ${{ needs.resolve.outputs.harbor_tag }}."
