@@ -1,0 +1,232 @@
+name: Build ARM64 Harbor Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      harbor_tag:
+        description: "Upstream Harbor tag to build, for example v2.15.1. Leave empty for latest stable."
+        required: false
+        type: string
+      publish_latest:
+        description: "Also maintain latest-arm64 tags."
+        required: false
+        default: true
+        type: boolean
+      force_rebuild:
+        description: "Build even if ARM64 tags already exist."
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # GitHub cron cannot express an exact rolling 14-day interval. This runs
+    # twice a month, which is close enough for release polling.
+    - cron: "23 4 1,15 * *"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: harbor-arm64-${{ github.event.inputs.harbor_tag || 'latest' }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAMESPACE: ghcr.io/abhi1693
+  UPSTREAM_REPO: https://github.com/goharbor/harbor.git
+
+jobs:
+  build-arm64:
+    name: Build ARM64 images
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve upstream tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${{ github.event.inputs.harbor_tag || '' }}"
+          if [ -z "$tag" ]; then
+            tag="$(git ls-remote --tags "$UPSTREAM_REPO" 'refs/tags/v*' \
+              | awk '{print $2}' \
+              | sed -E 's#refs/tags/##; s/\^\{\}//' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1)"
+          fi
+
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Harbor tag: $tag" >&2
+            exit 1
+          fi
+
+          echo "harbor_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream Harbor tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/harbor-src
+          git clone --depth=1 --branch "${{ steps.tag.outputs.harbor_tag }}" "$UPSTREAM_REPO" /tmp/harbor-src
+
+      - name: Determine image set
+        id: images
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          images=(
+            prepare
+            harbor-log
+            harbor-db
+            harbor-portal
+            harbor-core
+            harbor-jobservice
+            harbor-registryctl
+            nginx-photon
+            registry-photon
+            trivy-adapter-photon
+            harbor-exporter
+          )
+
+          if [ -d /tmp/harbor-src/make/photon/valkey ]; then
+            images+=(valkey-photon)
+          else
+            images+=(redis-photon)
+          fi
+
+          printf '%s\n' "${images[@]}" | sort -u > "$RUNNER_TEMP/harbor-images.txt"
+          {
+            echo "images<<EOF"
+            cat "$RUNNER_TEMP/harbor-images.txt"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check registry tags
+        id: registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_arm64() {
+            docker manifest inspect -v "$1" 2>/dev/null | jq -e '
+              if type == "array" then
+                any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
+              else
+                .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
+              end
+            ' >/dev/null
+          }
+
+          force_rebuild="${{ github.event.inputs.force_rebuild || 'false' }}"
+          publish_latest="${{ github.event.inputs.publish_latest || 'true' }}"
+          harbor_tag="${{ steps.tag.outputs.harbor_tag }}"
+          build=false
+          alias_missing=false
+
+          if [ "$force_rebuild" = "true" ]; then
+            build=true
+          else
+            while IFS= read -r image; do
+              [ -n "$image" ] || continue
+              exact="${IMAGE_NAMESPACE}/${image}:${harbor_tag}"
+              arch="${IMAGE_NAMESPACE}/${image}:${harbor_tag}-arm64"
+              latest="${IMAGE_NAMESPACE}/${image}:latest-arm64"
+
+              if ! has_arm64 "$exact"; then
+                echo "Missing ARM64 image: $exact"
+                build=true
+                continue
+              fi
+
+              if ! has_arm64 "$arch"; then
+                echo "Missing ARM64 alias: $arch"
+                alias_missing=true
+              fi
+
+              if [ "$publish_latest" = "true" ] && ! has_arm64 "$latest"; then
+                echo "Missing latest alias: $latest"
+                alias_missing=true
+              fi
+            done <<< "${{ steps.images.outputs.images }}"
+          fi
+
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "alias_missing=${alias_missing}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish missing ARM64 images
+        if: steps.registry.outputs.build == 'true'
+        env:
+          HARBOR_TAG: ${{ steps.tag.outputs.harbor_tag }}
+          PUBLISH_LATEST: ${{ github.event.inputs.publish_latest || 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/build-ghcr-arm64.sh /tmp/harbor-src "$HARBOR_TAG"
+
+      - name: Maintain alias tags without rebuilding
+        if: steps.registry.outputs.build != 'true' && steps.registry.outputs.alias_missing == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          has_arm64() {
+            docker manifest inspect -v "$1" 2>/dev/null | jq -e '
+              if type == "array" then
+                any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
+              else
+                .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
+              end
+            ' >/dev/null
+          }
+
+          publish_latest="${{ github.event.inputs.publish_latest || 'true' }}"
+          harbor_tag="${{ steps.tag.outputs.harbor_tag }}"
+
+          while IFS= read -r image; do
+            [ -n "$image" ] || continue
+            exact="${IMAGE_NAMESPACE}/${image}:${harbor_tag}"
+            arch="${IMAGE_NAMESPACE}/${image}:${harbor_tag}-arm64"
+            latest="${IMAGE_NAMESPACE}/${image}:latest-arm64"
+
+            if ! has_arm64 "$arch"; then
+              docker buildx imagetools create -t "$arch" "$exact"
+            fi
+
+            if [ "$publish_latest" = "true" ] && ! has_arm64 "$latest"; then
+              docker buildx imagetools create -t "$latest" "$exact"
+            fi
+          done <<< "${{ steps.images.outputs.images }}"
+
+      - name: Report skipped build
+        if: steps.registry.outputs.build != 'true' && steps.registry.outputs.alias_missing != 'true'
+        run: echo "All ARM64 images already exist for ${{ steps.tag.outputs.harbor_tag }}."
+
+      - name: Verify published image platform
+        if: steps.registry.outputs.build == 'true' || steps.registry.outputs.alias_missing == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker manifest inspect -v "${IMAGE_NAMESPACE}/harbor-core:${{ steps.tag.outputs.harbor_tag }}" \
+            | jq -e '
+              if type == "array" then
+                any(.[]; .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64")
+              else
+                .Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "arm64"
+              end
+            '
