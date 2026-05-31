@@ -252,6 +252,11 @@ build_component() {
 
   echo "Building ${IMAGE_NAMESPACE}/${image}:${harbor_tag} with ${target}"
   cd "$source_dir"
+  if [ "$target" = "_build_registryctl" ]; then
+    echo "Priming registry binary required by harbor-registryctl"
+    make build "BUILDTARGET=_build_registry" "${make_args[@]}"
+  fi
+
   make build "BUILDTARGET=${target}" "${make_args[@]}"
 
   push_component_image "$harbor_tag" "$image"
